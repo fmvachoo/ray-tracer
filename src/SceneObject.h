@@ -14,12 +14,16 @@ public:
 
     QString name() const { return m_name; }
     QString objPath() const { return m_objPath; }
+    QString path() const { return m_objPath; }
 
     Material &material() { return m_material; }
     const Material &material() const { return m_material; }
     const Mesh &mesh() const { return m_mesh; }
 
     bool loadMesh();
+    bool isLoaded() const { return !m_mesh.vertices.isEmpty(); }
+    bool isGLInitialized() const { return m_glInitialized; }
+
     void initGL();
     void draw();
     void destroyGL();

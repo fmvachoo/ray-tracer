@@ -28,7 +28,7 @@ void Scene::createDefault()
     clear();
     m_camera.reset();
 
-    QString basePath = QCoreApplication::applicationDirPath();
+    QString basePath = "D:/ITMO/3D_visual/RayTracer";
     qDebug() << "App dir:" << basePath;
 
     struct ObjDef {

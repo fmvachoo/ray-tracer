@@ -52,7 +52,7 @@ void MainWindow::setupUI()
     statusBar()->showMessage("Ready");
 
     connect(m_propertiesPanel, &PropertiesPanel::sceneChanged, m_viewport, [this]() {
-        m_viewport->setPreviewMode();
+        m_viewport->setPreviewMode(); // m_lightBuffersDirty = true
         m_viewport->update();
     });
 

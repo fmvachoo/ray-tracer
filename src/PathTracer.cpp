@@ -267,9 +267,11 @@ void PathTracer::uploadSceneData(const Scene &scene)
                        m_bvhNodes.constData(), GL_STATIC_DRAW);
 }
 
-void PathTracer::render(const Scene &scene, int samplesPerPixel)
+void PathTracer::render(const Scene &scene, int width, int height, int samplesPerPixel)
 {
     if (!m_initialized) return;
+
+    resize(width, height);
 
     uploadSceneData(scene);
 

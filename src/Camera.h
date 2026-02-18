@@ -10,6 +10,7 @@ public:
 
     void reset();
     void rotate(float dx, float dy);
+    void orbit(float dx, float dy) { rotate(dx, dy); }
     void pan(float dx, float dy);
     void zoom(float delta);
 

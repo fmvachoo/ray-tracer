@@ -5,5 +5,7 @@
         <file alias="pathtracer.comp">shaders/pathtracer.comp</file>
         <file alias="tonemap.vert">shaders/tonemap.vert</file>
         <file alias="tonemap.frag">shaders/tonemap.frag</file>
+	<file alias="light.vert">shaders/light.vert</file>
+        <file alias="light.frag">shaders/light.frag</file>
     </qresource>
 </RCC>

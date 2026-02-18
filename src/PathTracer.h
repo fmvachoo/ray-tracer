@@ -14,7 +14,7 @@ public:
     void destroy();
 
     void resize(int w, int h);
-    void render(const Scene &scene, int samplesPerPixel = 64);
+    void render(const Scene &scene, int width, int height, int samplesPerPixel = 64);
     void displayResult();
 
     bool isReady() const { return m_initialized; }

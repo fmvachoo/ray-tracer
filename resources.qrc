@@ -1,0 +1,9 @@
+<RCC>
+    <qresource prefix="/shaders">
+        <file alias="preview.vert">shaders/preview.vert</file>
+        <file alias="preview.frag">shaders/preview.frag</file>
+        <file alias="pathtracer.comp">shaders/pathtracer.comp</file>
+        <file alias="tonemap.vert">shaders/tonemap.vert</file>
+        <file alias="tonemap.frag">shaders/tonemap.frag</file>
+    </qresource>
+</RCC>

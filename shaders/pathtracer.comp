@@ -1,0 +1,368 @@
+#version 430 core
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba32f, binding = 0) uniform image2D u_output;
+
+// Triangle: v0(3)+pad, v1(3)+pad, v2(3)+pad, n0(3)+pad, n1(3)+pad, n2(3)+pad, matIdx+pad3
+struct Triangle {
+    vec3 v0; float _p0;
+    vec3 v1; float _p1;
+    vec3 v2; float _p2;
+    vec3 n0; float _p3;
+    vec3 n1; float _p4;
+    vec3 n2; float _p5;
+    int materialIndex;
+    int _pad1, _pad2, _pad3;
+};
+
+struct Material {
+    vec3 color;
+    float roughness;
+    float transparency;
+    float _p1, _p2, _p3;
+};
+
+struct BVHNode {
+    vec3 bmin;
+    int leftOrStart;
+    vec3 bmax;
+    int rightOrCount; // >= 0: leaf (count), < 0: interior (-rightChild - 1)
+};
+
+layout(std430, binding = 1) readonly buffer TriangleBuffer {
+    Triangle triangles[];
+};
+
+layout(std430, binding = 2) readonly buffer MaterialBuffer {
+    Material materials[];
+};
+
+layout(std430, binding = 3) readonly buffer BVHBuffer {
+    BVHNode bvhNodes[];
+};
+
+uniform vec2 u_resolution;
+uniform vec3 u_cameraPos;
+uniform vec3 u_cameraFront;
+uniform vec3 u_cameraRight;
+uniform vec3 u_cameraUp;
+uniform float u_fov;
+uniform int u_samples;
+uniform int u_numTriangles;
+uniform int u_numBVHNodes;
+uniform float u_seed;
+
+// ---- RNG ----
+uint rngState;
+
+void initRNG(uvec2 pixel, uint frame) {
+    rngState = pixel.x * 1973u + pixel.y * 9277u + frame * 26699u + uint(u_seed);
+}
+
+uint xorshift() {
+    rngState ^= rngState << 13u;
+    rngState ^= rngState >> 17u;
+    rngState ^= rngState << 5u;
+    return rngState;
+}
+
+float rand01() {
+    return float(xorshift()) / 4294967295.0;
+}
+
+// ---- Ray ----
+struct Ray {
+    vec3 origin;
+    vec3 dir;
+};
+
+struct HitInfo {
+    float t;
+    vec3 normal;
+    int materialIndex;
+    vec2 uv; // barycentric
+};
+
+// ---- Ray-Triangle intersection (Möller–Trumbore) ----
+bool intersectTriangle(Ray ray, Triangle tri, out float t, out vec3 normal, out vec2 bary) {
+    vec3 e1 = tri.v1 - tri.v0;
+    vec3 e2 = tri.v2 - tri.v0;
+    vec3 h = cross(ray.dir, e2);
+    float a = dot(e1, h);
+    if (abs(a) < 1e-8) return false;
+
+    float f = 1.0 / a;
+    vec3 s = ray.origin - tri.v0;
+    float u = f * dot(s, h);
+    if (u < 0.0 || u > 1.0) return false;
+
+    vec3 q = cross(s, e1);
+    float v = f * dot(ray.dir, q);
+    if (v < 0.0 || u + v > 1.0) return false;
+
+    t = f * dot(e2, q);
+    if (t < 0.001) return false;
+
+    bary = vec2(u, v);
+    // Interpolate normal
+    normal = normalize(tri.n0 * (1.0 - u - v) + tri.n1 * u + tri.n2 * v);
+    return true;
+}
+
+// ---- Ray-AABB intersection ----
+bool intersectAABB(Ray ray, vec3 bmin, vec3 bmax, float tMax) {
+    vec3 invDir = 1.0 / ray.dir;
+    vec3 t0 = (bmin - ray.origin) * invDir;
+    vec3 t1 = (bmax - ray.origin) * invDir;
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+    float enter = max(max(tmin.x, tmin.y), tmin.z);
+    float exit_ = min(min(tmax.x, tmax.y), tmax.z);
+    return enter <= exit_ && exit_ >= 0.0 && enter < tMax;
+}
+
+// ---- BVH Traversal ----
+bool traceScene(Ray ray, out HitInfo hit) {
+    hit.t = 1e30;
+    hit.materialIndex = -1;
+    bool found = false;
+
+    if (u_numBVHNodes == 0) return false;
+
+    // Stack-based traversal
+    int stack[64];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0; // root
+
+    while (stackPtr > 0) {
+        int nodeIdx = stack[--stackPtr];
+        BVHNode node = bvhNodes[nodeIdx];
+
+        if (!intersectAABB(ray, node.bmin, node.bmax, hit.t))
+            continue;
+
+        if (node.rightOrCount >= 0) {
+            // Leaf node
+            int start = node.leftOrStart;
+            int count = node.rightOrCount;
+            for (int i = start; i < start + count; ++i) {
+                float t;
+                vec3 n;
+                vec2 bary;
+                if (intersectTriangle(ray, triangles[i], t, n, bary) && t < hit.t) {
+                    hit.t = t;
+                    hit.normal = n;
+                    hit.materialIndex = triangles[i].materialIndex;
+                    hit.uv = bary;
+                    found = true;
+                }
+            }
+        } else {
+            // Interior node
+            int left = node.leftOrStart;
+            int right = -(node.rightOrCount + 1);
+            stack[stackPtr++] = left;
+            stack[stackPtr++] = right;
+        }
+    }
+
+    return found;
+}
+
+// ---- Sampling hemisphere ----
+vec3 cosineWeightedHemisphere(vec3 normal) {
+    float u1 = rand01();
+    float u2 = rand01();
+    float r = sqrt(u1);
+    float theta = 6.28318530718 * u2;
+
+    vec3 tangent;
+    if (abs(normal.x) > 0.9)
+        tangent = normalize(cross(normal, vec3(0, 1, 0)));
+    else
+        tangent = normalize(cross(normal, vec3(1, 0, 0)));
+    vec3 bitangent = cross(normal, tangent);
+
+    return normalize(tangent * r * cos(theta) + bitangent * r * sin(theta) + normal * sqrt(1.0 - u1));
+}
+
+// GGX importance sampling for specular
+vec3 sampleGGX(vec3 N, float roughness) {
+    float a = roughness * roughness;
+    float u1 = rand01();
+    float u2 = rand01();
+
+    float cosTheta = sqrt((1.0 - u1) / (1.0 + (a * a - 1.0) * u1));
+    float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
+    float phi = 6.28318530718 * u2;
+
+    vec3 H;
+    H.x = sinTheta * cos(phi);
+    H.y = sinTheta * sin(phi);
+    H.z = cosTheta;
+
+    vec3 tangent;
+    if (abs(N.x) > 0.9)
+        tangent = normalize(cross(N, vec3(0, 1, 0)));
+    else
+        tangent = normalize(cross(N, vec3(1, 0, 0)));
+    vec3 bitangent = cross(N, tangent);
+
+    return normalize(tangent * H.x + bitangent * H.y + N * H.z);
+}
+
+// ---- Fresnel (Schlick) ----
+float fresnelSchlick(float cosTheta, float F0) {
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+// ---- Path trace ----
+vec3 pathTrace(Ray ray) {
+    vec3 throughput = vec3(1.0);
+    vec3 radiance = vec3(0.0);
+
+    // Simple area light at top of Cornell box
+    vec3 lightPos = vec3(0.0, 1.95, 0.0);
+    vec3 lightEmission = vec3(15.0);
+    float lightRadius = 0.5;
+
+    for (int bounce = 0; bounce < 6; ++bounce) {
+        HitInfo hit;
+        if (!traceScene(ray, hit)) {
+            // Sky / environment
+            float t = 0.5 * (ray.dir.y + 1.0);
+            vec3 sky = mix(vec3(0.02), vec3(0.05, 0.08, 0.15), t);
+            radiance += throughput * sky;
+            break;
+        }
+
+        vec3 hitPoint = ray.origin + ray.dir * hit.t;
+        vec3 N = hit.normal;
+
+        // Make sure normal faces the ray
+        if (dot(N, ray.dir) > 0.0)
+            N = -N;
+
+        Material mat = materials[hit.materialIndex];
+
+        // Emission check: if we're near the light area
+        if (hitPoint.y > 1.9 && abs(hitPoint.x) < lightRadius && abs(hitPoint.z) < lightRadius) {
+            radiance += throughput * lightEmission;
+            break;
+        }
+
+        // Direct light sampling (Next Event Estimation)
+        {
+            vec3 lightSample = lightPos + vec3(
+                (rand01() - 0.5) * 2.0 * lightRadius,
+                0.0,
+                (rand01() - 0.5) * 2.0 * lightRadius
+            );
+            vec3 toLight = lightSample - hitPoint;
+            float lightDist = length(toLight);
+            vec3 L = toLight / lightDist;
+            float NdotL = dot(N, L);
+
+            if (NdotL > 0.0) {
+                Ray shadowRay;
+                shadowRay.origin = hitPoint + N * 0.001;
+                shadowRay.dir = L;
+                HitInfo shadowHit;
+                bool blocked = traceScene(shadowRay, shadowHit) && shadowHit.t < lightDist - 0.01;
+
+                if (!blocked) {
+                    float lightArea = 4.0 * lightRadius * lightRadius;
+                    float pdf = lightDist * lightDist / (NdotL * lightArea);
+                    vec3 brdf = mat.color / 3.14159265;
+                    radiance += throughput * brdf * lightEmission * NdotL / max(pdf, 0.001);
+                }
+            }
+        }
+
+        // Choose between diffuse, specular, and transmissive
+        float F0 = 0.04;
+        float cosTheta = abs(dot(-ray.dir, N));
+        float fresnel = fresnelSchlick(cosTheta, F0);
+
+        float pSpecular = fresnel;
+        float pTransmit = mat.transparency * (1.0 - fresnel);
+        float pDiffuse = 1.0 - pSpecular - pTransmit;
+        pDiffuse = max(pDiffuse, 0.0);
+
+        float rnd = rand01();
+
+        if (rnd < pTransmit && mat.transparency > 0.01) {
+            // Refraction (simple, IOR ~1.5)
+            float ior = 1.5;
+            float eta = dot(ray.dir, hit.normal) < 0.0 ? (1.0 / ior) : ior;
+            vec3 refracted = refract(ray.dir, N, eta);
+            if (length(refracted) < 0.001) {
+                // Total internal reflection
+                refracted = reflect(ray.dir, N);
+            }
+            ray.origin = hitPoint - N * 0.002;
+            ray.dir = normalize(refracted);
+            throughput *= mat.color;
+        } else if (rnd < pTransmit + pSpecular) {
+            // Specular GGX reflection
+            vec3 H = sampleGGX(N, max(mat.roughness, 0.01));
+            vec3 reflected = reflect(ray.dir, H);
+            if (dot(reflected, N) <= 0.0) break;
+            ray.origin = hitPoint + N * 0.001;
+            ray.dir = normalize(reflected);
+            throughput *= mix(vec3(1.0), mat.color, 0.5);
+        } else {
+            // Diffuse
+            vec3 newDir = cosineWeightedHemisphere(N);
+            ray.origin = hitPoint + N * 0.001;
+            ray.dir = newDir;
+            throughput *= mat.color;
+        }
+
+        // Russian roulette after 3 bounces
+        if (bounce > 2) {
+            float p = max(throughput.x, max(throughput.y, throughput.z));
+            if (rand01() > p) break;
+            throughput /= p;
+        }
+    }
+
+    return radiance;
+}
+
+void main()
+{
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(u_resolution.x) || pixel.y >= int(u_resolution.y))
+        return;
+
+    initRNG(uvec2(pixel), uint(u_seed * 1000.0));
+
+    float aspect = u_resolution.x / u_resolution.y;
+    float fovScale = tan(radians(u_fov) * 0.5);
+
+    vec3 accumulated = vec3(0.0);
+
+    for (int s = 0; s < u_samples; ++s) {
+        // Jittered pixel position
+        float px = (float(pixel.x) + rand01() - 0.5) / u_resolution.x * 2.0 - 1.0;
+        float py = (float(pixel.y) + rand01() - 0.5) / u_resolution.y * 2.0 - 1.0;
+
+        vec3 dir = normalize(
+            u_cameraFront +
+            u_cameraRight * px * aspect * fovScale +
+            u_cameraUp * py * fovScale
+        );
+
+        Ray ray;
+        ray.origin = u_cameraPos;
+        ray.dir = dir;
+
+        accumulated += pathTrace(ray);
+    }
+
+    accumulated /= float(u_samples);
+
+    imageStore(u_output, pixel, vec4(accumulated, 1.0));
+}
